@@ -37,30 +37,44 @@ from adapters import BaseAIAdapter, get_adapter
 
 # Setup logging: console + rotating log file (10MB per file, 3 backups)
 LOG_FILE = os.getenv("LOG_FILE", "adapter.log")
+LOG_LEVEL_NAME = os.getenv("LOG_LEVEL", "INFO").upper().strip()
+
 log_formatter = logging.Formatter(
     fmt="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
 logger = logging.getLogger("copilot-openai-adapter")
-logger.setLevel(logging.INFO)
 
 # Console handler
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(log_formatter)
-if not logger.handlers:
-    logger.addHandler(console_handler)
 
 # File handler with UTF-8 encoding
+handlers = [console_handler]
 try:
     file_handler = RotatingFileHandler(
         LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
     )
     file_handler.setFormatter(log_formatter)
-    logger.addHandler(file_handler)
+    handlers.append(file_handler)
 except Exception as e:
     print(f"Warning: Failed to setup log file '{LOG_FILE}': {e}")
 
+
+def set_log_level(level_name: str):
+    """Update logger and handler log levels."""
+    numeric_level = getattr(logging, (level_name or "INFO").upper().strip(), logging.INFO)
+    logger.setLevel(numeric_level)
+    for h in logger.handlers:
+        h.setLevel(numeric_level)
+
+
+if not logger.handlers:
+    for h in handlers:
+        logger.addHandler(h)
+
+set_log_level(LOG_LEVEL_NAME)
 logger.propagate = False
 
 # Active provider adapter instance
@@ -98,9 +112,10 @@ def mask_secret(secret: str) -> str:
 @app.middleware("http")
 async def log_requests_and_responses(request: Request, call_next):
     """
-    Middleware that logs every incoming request and outgoing response in full detail
-    (including headers, JSON body, latency, and streaming chunks) to console and adapter.log.
-    Secrets in headers are automatically masked.
+    Middleware that logs requests and responses.
+    - INFO level: logs only method, URL, client IP, target model, stream/tool counts, duration, and status (NO body content).
+    - DEBUG level: logs full request headers, request JSON body, full response body or aggregated SSE text.
+    - WARNING/ERROR level: logs only warnings and errors.
     """
     req_id = uuid.uuid4().hex[:8]
     start_time = time.time()
@@ -112,99 +127,147 @@ async def log_requests_and_responses(request: Request, call_next):
 
     # Read and buffer request body
     req_body_bytes = await request.body()
+    parsed_json = None
+    model_name = None
+    stream_flag = False
+    tools_count = 0
+    messages_count = 0
 
-    # Filter and mask headers for display
-    display_headers = {}
-    for k, v in request.headers.items():
-        if k.lower() in ("authorization", "x-goog-api-key"):
-            display_headers[k] = mask_secret(v)
-        elif k.lower() in ("user-agent", "content-type", "accept", "x-request-id", "host"):
-            display_headers[k] = v
-
-    # Format request body
-    body_display = "(empty)"
     if req_body_bytes:
         try:
             parsed_json = json.loads(req_body_bytes.decode("utf-8"))
-            body_display = json.dumps(parsed_json, indent=2, ensure_ascii=False)
+            if isinstance(parsed_json, dict):
+                model_name = parsed_json.get("model")
+                stream_flag = bool(parsed_json.get("stream", False))
+                messages = parsed_json.get("messages")
+                if isinstance(messages, list):
+                    messages_count = len(messages)
+                tools = parsed_json.get("tools")
+                if isinstance(tools, list):
+                    tools_count = len(tools)
         except Exception:
-            body_display = req_body_bytes.decode("utf-8", errors="replace")
+            pass
 
-    logger.info(
-        f"\n{'='*25} [REQUEST #{req_id}] {'='*25}\n"
-        f"Time       : {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"Endpoint   : {method} {full_url}\n"
-        f"Client IP  : {client_host}\n"
-        f"Headers    :\n{json.dumps(display_headers, indent=2, ensure_ascii=False)}\n"
-        f"Body       :\n{body_display}\n"
-        f"{'-'*70}"
-    )
+    if not model_name:
+        for prefix in ("/v1/models/", "/models/"):
+            if url_path.startswith(prefix) and len(url_path) > len(prefix):
+                model_name = url_path[len(prefix):]
+                break
+
+    # Format concise metadata tags for INFO level
+    req_tags = []
+    if model_name:
+        req_tags.append(f"Model: {model_name}")
+    if stream_flag:
+        req_tags.append("Stream: true")
+    if messages_count:
+        req_tags.append(f"Messages: {messages_count}")
+    if tools_count:
+        req_tags.append(f"Tools: {tools_count}")
+    req_tags_str = f" | {' | '.join(req_tags)}" if req_tags else ""
+
+    logger.info(f"[REQUEST #{req_id}] {method} {full_url}{req_tags_str} | Client: {client_host}")
+
+    # DEBUG level: output detailed headers and request body
+    if logger.isEnabledFor(logging.DEBUG):
+        display_headers = {}
+        for k, v in request.headers.items():
+            if k.lower() in ("authorization", "x-goog-api-key"):
+                display_headers[k] = mask_secret(v)
+            elif k.lower() in ("user-agent", "content-type", "accept", "x-request-id", "host"):
+                display_headers[k] = v
+
+        body_display = "(empty)"
+        if req_body_bytes:
+            if parsed_json is not None:
+                body_display = json.dumps(parsed_json, indent=2, ensure_ascii=False)
+            else:
+                body_display = req_body_bytes.decode("utf-8", errors="replace")
+
+        logger.debug(
+            f"\n{'='*25} [REQUEST DETAILS #{req_id}] {'='*25}\n"
+            f"Endpoint   : {method} {full_url}\n"
+            f"Headers    :\n{json.dumps(display_headers, indent=2, ensure_ascii=False)}\n"
+            f"Body       :\n{body_display}\n"
+            f"{'-'*70}"
+        )
 
     try:
         response = await call_next(request)
     except Exception as exc:
         duration_ms = (time.time() - start_time) * 1000
         logger.error(
-            f"\n{'='*25} [ERROR #{req_id}] {'='*25}\n"
-            f"Endpoint   : {method} {full_url}\n"
-            f"Duration   : {duration_ms:.2f} ms\n"
-            f"Exception  : {type(exc).__name__}: {exc}\n"
-            f"{'='*70}\n"
+            f"[ERROR #{req_id}] {method} {full_url} | Duration: {duration_ms:.2f} ms | Exception: {type(exc).__name__}: {exc}"
         )
         raise exc
 
     content_type = response.headers.get("content-type", "")
 
-    # For streaming SSE responses: stream chunks in real-time and aggregate for logging
+    # For streaming SSE responses
     if "text/event-stream" in content_type:
         orig_iterator = response.body_iterator
-        accumulated_chunks = []
-        accumulated_text = []
+        is_debug = logger.isEnabledFor(logging.DEBUG)
+        accumulated_chunks = [] if is_debug else None
+        accumulated_text = [] if is_debug else None
+        chunk_count = 0
+        tool_calls_preview = []
 
         async def stream_wrapper():
+            nonlocal chunk_count
             try:
                 async for chunk in orig_iterator:
-                    accumulated_chunks.append(chunk)
+                    chunk_count += 1
+                    if is_debug and accumulated_chunks is not None:
+                        accumulated_chunks.append(chunk)
+
+                    # Extract content/tool calls for summary & debug
+                    try:
+                        chunk_str = chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else str(chunk)
+                        for line in chunk_str.splitlines():
+                            if line.startswith("data:") and line[5:].strip() != "[DONE]":
+                                d = json.loads(line[5:].strip())
+                                choice = d.get("choices", [{}])[0]
+                                delta = choice.get("delta", {})
+                                if is_debug and accumulated_text is not None:
+                                    delta_text = delta.get("content", "")
+                                    if delta_text:
+                                        accumulated_text.append(delta_text)
+                                for tc in delta.get("tool_calls", []):
+                                    fname = tc.get("function", {}).get("name")
+                                    if fname and fname not in tool_calls_preview:
+                                        tool_calls_preview.append(fname)
+                    except Exception:
+                        pass
+
                     yield chunk
             except asyncio.CancelledError:
                 logger.info(f"[{req_id}] Client disconnected from SSE stream.")
                 raise
             finally:
                 duration_ms = (time.time() - start_time) * 1000
-                full_stream_bytes = b"".join(accumulated_chunks)
-                full_stream_str = full_stream_bytes.decode("utf-8", errors="replace")
-
-                # Extract content text and tool calls from SSE chunks for clean preview
-                tool_calls_preview = []
-                for line in full_stream_str.splitlines():
-                    if line.startswith("data:") and line[5:].strip() != "[DONE]":
-                        try:
-                            d = json.loads(line[5:].strip())
-                            choice = d.get("choices", [{}])[0]
-                            delta = choice.get("delta", {})
-                            delta_text = delta.get("content", "")
-                            if delta_text:
-                                accumulated_text.append(delta_text)
-                            tcs = delta.get("tool_calls", [])
-                            for tc in tcs:
-                                fn = tc.get("function", {})
-                                tool_calls_preview.append(f"{fn.get('name')}({fn.get('arguments', '')})")
-                        except Exception:
-                            pass
-
-                aggregated_output = "".join(accumulated_text)
+                stream_tags = []
+                if model_name:
+                    stream_tags.append(f"Model: {model_name}")
+                if chunk_count:
+                    stream_tags.append(f"Chunks: {chunk_count}")
                 if tool_calls_preview:
-                    aggregated_output += f"\n[Tool Calls: {', '.join(tool_calls_preview)}]"
+                    stream_tags.append(f"Tool Calls: {', '.join(tool_calls_preview)}")
+                stream_tags_str = f" | {' | '.join(stream_tags)}" if stream_tags else ""
 
                 logger.info(
-                    f"\n{'='*25} [STREAM RESPONSE #{req_id}] {'='*25}\n"
-                    f"Status     : {response.status_code}\n"
-                    f"Duration   : {duration_ms:.2f} ms\n"
-                    f"Endpoint   : {method} {full_url}\n"
-                    f"Chunks     : {len(accumulated_chunks)} SSE events\n"
-                    f"Output Text:\n{aggregated_output}\n"
-                    f"{'='*70}\n"
+                    f"[STREAM RESPONSE #{req_id}] {method} {full_url} | Status: {response.status_code} | Duration: {duration_ms:.2f} ms{stream_tags_str}"
                 )
+
+                if is_debug:
+                    full_text = "".join(accumulated_text or [])
+                    logger.debug(
+                        f"\n{'='*25} [STREAM DETAILS #{req_id}] {'='*25}\n"
+                        f"Status     : {response.status_code}\n"
+                        f"Duration   : {duration_ms:.2f} ms\n"
+                        f"Chunks     : {chunk_count} SSE events\n"
+                        f"Output Text:\n{full_text}\n"
+                        f"{'='*70}"
+                    )
 
         return StreamingResponse(
             stream_wrapper(),
@@ -212,27 +275,48 @@ async def log_requests_and_responses(request: Request, call_next):
             headers=dict(response.headers),
         )
     else:
-        # For non-streaming responses: read body parts, log and return
+        # For non-streaming responses
         resp_parts = [part async for part in response.body_iterator]
         duration_ms = (time.time() - start_time) * 1000
         full_resp_bytes = b"".join(resp_parts)
 
-        resp_display = "(empty)"
+        resp_tags = []
+        if model_name:
+            resp_tags.append(f"Model: {model_name}")
+
+        parsed_resp = None
         if full_resp_bytes:
             try:
-                parsed_json = json.loads(full_resp_bytes.decode("utf-8"))
-                resp_display = json.dumps(parsed_json, indent=2, ensure_ascii=False)
+                parsed_resp = json.loads(full_resp_bytes.decode("utf-8"))
+                if isinstance(parsed_resp, dict):
+                    usage = parsed_resp.get("usage")
+                    if isinstance(usage, dict) and "total_tokens" in usage:
+                        resp_tags.append(f"Tokens: {usage['total_tokens']}")
+                    if "error" in parsed_resp:
+                        err_msg = str(parsed_resp["error"].get("message", "Error"))
+                        resp_tags.append(f"Error: {err_msg[:60]}")
             except Exception:
-                resp_display = full_resp_bytes.decode("utf-8", errors="replace")
+                pass
+
+        resp_tags_str = f" | {' | '.join(resp_tags)}" if resp_tags else ""
 
         logger.info(
-            f"\n{'='*25} [RESPONSE #{req_id}] {'='*25}\n"
-            f"Status     : {response.status_code}\n"
-            f"Duration   : {duration_ms:.2f} ms\n"
-            f"Endpoint   : {method} {full_url}\n"
-            f"Body       :\n{resp_display}\n"
-            f"{'='*70}\n"
+            f"[RESPONSE #{req_id}] {method} {full_url} | Status: {response.status_code} | Duration: {duration_ms:.2f} ms{resp_tags_str}"
         )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            resp_display = "(empty)"
+            if full_resp_bytes:
+                if parsed_resp is not None:
+                    resp_display = json.dumps(parsed_resp, indent=2, ensure_ascii=False)
+                else:
+                    resp_display = full_resp_bytes.decode("utf-8", errors="replace")
+
+            logger.debug(
+                f"\n{'='*25} [RESPONSE BODY #{req_id}] {'='*25}\n"
+                f"{resp_display}\n"
+                f"{'='*70}"
+            )
 
         headers = dict(response.headers)
         headers.pop("content-length", None)
@@ -442,6 +526,12 @@ def main():
     parser.add_argument("--key", default=None, help="API Key override")
     parser.add_argument("--model", default=None, help="Default Model override")
     parser.add_argument("--log-file", default=None, help="Path to log file")
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "debug", "info", "warning", "error"],
+        help="Logging level (DEBUG, INFO, WARNING, ERROR; default: INFO)",
+    )
 
     args = parser.parse_args()
 
@@ -456,9 +546,12 @@ def main():
             adapter._default_model = args.model
     if args.log_file:
         LOG_FILE = args.log_file
+    if args.log_level:
+        set_log_level(args.log_level)
 
     resolved_key = adapter.resolve_api_key()
     masked_key = mask_secret(resolved_key) if resolved_key else "(not set - configure in .env)"
+    current_level = logging.getLevelName(logger.level)
 
     print("=" * 60)
     print(" Copilot OpenAI Adapter Server (Multi-Provider)")
@@ -466,6 +559,7 @@ def main():
     print(f" AI Provider        : {adapter.provider_name}")
     print(f" API Key            : {masked_key}")
     print(f" Default Model      : {adapter.default_model}")
+    print(f" Log Level          : {current_level}")
     print(f" Listening Address  : http://{args.host}:{args.port}")
     print(f" OpenAI Base URL    : http://127.0.0.1:{args.port}/v1")
     print(f" Models Endpoint    : http://127.0.0.1:{args.port}/v1/models")

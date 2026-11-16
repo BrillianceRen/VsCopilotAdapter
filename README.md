@@ -46,11 +46,12 @@ copilot-openai-adapter/
    - 所有 Gemini 上游通信均通过安全请求头 `x-goog-api-key` 传输，避免在 URL 参数中暴露密钥。
    - 调试日志自动对 `authorization` 和 `x-goog-api-key` 请求头进行脱敏掩码处理（如 `AQ.Ab8...****`）。
 
-2. **全链路请求与响应详细日志记录（调试利器）**：
-   - 自动拦截并记录每一个进入的 HTTP 请求（包含客户端 IP、请求时间、脱敏请求头、JSON 请求体格式化输出）。
-   - 自动记录每一个响应（包含 HTTP 状态码、请求耗时毫秒数、响应 JSON 内容）。
-   - **流式 SSE 深度支持**：针对 Copilot 流式对话，既保证每个数据块实时送达客户端，又在后台完整聚合流式结果、事件总数与耗时并打印。
-   - **双路输出**：同时打印到控制台屏幕并持久化保存到 [adapter.log](file:///d:/Program/AI/copilot-openai-adapter/adapter.log)（支持 UTF-8 编码、自动按 10MB 轮转备份）。
+2. **灵活的日志等级与全链路监控（轻量/深度调试自由切换）**：
+   - **支持日志等级配置（`LOG_LEVEL`）**：支持 `INFO`、`DEBUG`、`WARNING`、`ERROR`，支持通过 `.env` 或命令行 `--log-level` 灵活设定。
+   - **`INFO` 等级（推荐/默认模式）**：清晰紧凑，**仅输出请求/应答 URL、方法、状态码、模型名称、耗时、Token/Chunk 统计**，**杜绝打印具体的请求体、Prompt 与消息正文**，既保护隐私又避免控制台刷屏。
+   - **`DEBUG` 等级（排错模式）**：输出完整的请求头、请求 JSON 参数明细、完整应答体或 SSE 完整流式文本聚合。
+   - **流式 SSE 深度统计**：实时统计流式事件块数（Chunks）、工具调用识别与精准耗时（ms）。
+   - **双路输出与持久化**：同时输出到控制台与 [adapter.log](file:///d:/Program/AI/copilot-openai-adapter/adapter.log)（支持 UTF-8 编码、自动按 10MB 轮转备份）。
 
 3. **完全实现 OpenAI 模型接口（满足题目要求）**：
    - `GET /models` 与 `GET /v1/models`：动态拉取 Gemini 官方支持的模型列表，并补充标准别名（如 `gpt-4o`、`gpt-4-turbo` 等）。
@@ -93,6 +94,9 @@ DEFAULT_MODEL=gemini-3.8-flash
 
 # 关闭深度思考过程以确保代码快速补全
 GEMINI_THINKING_BUDGET=0
+
+# 日志等级：INFO（仅输出请求/响应URL、模型与耗时，不输出具体内容）、DEBUG（输出完整请求体与应答详情）
+LOG_LEVEL=INFO
 
 # 日志文件路径
 LOG_FILE=adapter.log

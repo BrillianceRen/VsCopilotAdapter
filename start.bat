@@ -11,5 +11,5 @@ if exist "C:\Users\Brilliance\AppData\Local\Python\bin\python.exe" (
     set PYTHON_CMD="C:\Users\Brilliance\AppData\Local\Python\bin\python.exe"
 )
 
-%PYTHON_CMD% server.py --host 0.0.0.0 --port 8000
+%PYTHON_CMD% server.py --host 0.0.0.0 --port 8000 %*
 pause
