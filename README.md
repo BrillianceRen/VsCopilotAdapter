@@ -21,6 +21,7 @@ copilot-openai-adapter/
 ├── .env                      # 本地私密配置文件（包含 API Key，被 gitignore 保护）
 ├── .env.example              # 安全配置示例模板
 ├── .gitignore                # Git 忽略规则，防止私密及日志泄漏
+├── CHANGELOG.md              # 详细版本演进与更新历史记录
 ├── adapter.log               # 运行及全量调试日志（自动按 10MB 轮转备份）
 ├── requirements.txt          # Python 依赖清单
 ├── server.py                 # FastAPI 主服务端（通用路由与全链路日志中间件）
@@ -191,3 +192,18 @@ python test_adapter.py
 - [x] 对话补全流式 SSE 请求 (`POST /v1/chat/completions?stream=true`)
 - [x] 代码内联补全请求 (`POST /v1/completions`)
 - [x] Agent 工具/函数调用流式识别 (`tools / functionCalling`)
+
+---
+
+## 更新记录 (Changelog)
+
+完整历史与详细变更请参阅 [CHANGELOG.md](file:///d:/Program/AI/copilot-openai-adapter/CHANGELOG.md)。
+
+| 版本 | 发布日期 | 核心变更摘要 |
+| :--- | :--- | :--- |
+| **v1.2.1** | 2026-11-20 | 完善文档架构、补充企业级高可用原理及标准更新记录归档。 |
+| **v1.2.0** | 2026-11-20 | 针对长上下文/多工具场景引入 **双协议自适应降级（HTTP/2 ↔ HTTP/1.1）**，全面捕获 `httpx.TransportError` 15 种传输错误，实现断连平滑兜底。 |
+| **v1.1.0** | 2026-11-20 | 解决流式请求静默断开（`RemoteProtocolError`），实现 **延迟首包机制（Deferred Initial Chunk）** 与指数退避重试。 |
+| **v1.0.1** | 2026-11-16 | 引入结构化分级日志（`LOG_LEVEL`），`INFO` 级别完全剔除 Prompt 与请求/响应正文，专注元数据审计与防窥保护。 |
+| **v1.0.0** | 2026-11-16 | 初始版本发布：模块化多适配器架构、AI Studio Gemini 适配器、Visual Studio Copilot Agent 全功能兼容、密钥安全隔离。 |
+
