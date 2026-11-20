@@ -42,8 +42,8 @@ copilot-openai-adapter/
 
 ### 1. 安全配置与隐私保护
 - **敏感信息隔离**：密钥采用 `.env` 配置文件与环境变量隔离，严禁代码硬编码。
-- **安全模板**：提供安全配置模板 [.env.example](file:///d:/Program/AI/copilot-openai-adapter/.env.example)。
-- **防泄漏保护**：配备 [.gitignore](file:///d:/Program/AI/copilot-openai-adapter/.gitignore)，自动忽略 `.env`、日志文件和缓存文件，杜绝密钥泄露风险。
+- **安全模板**：提供安全配置模板 [.env.example](file:///.env.example)。
+- **防泄漏保护**：配备 [.gitignore](file:///.gitignore)，自动忽略 `.env`、日志文件和缓存文件，杜绝密钥泄露风险。
 - **头部鉴权通信**：所有与 Google Gemini 上游通信均通过安全请求头 `x-goog-api-key` 传输，避免在 URL 参数中暴露密钥。
 - **日志自动脱敏**：调试日志自动对 `authorization` 和 `x-goog-api-key` 请求头进行掩码遮蔽（如 `AQ.Ab8...****`）。
 
@@ -59,7 +59,7 @@ copilot-openai-adapter/
 - **`INFO` 级别（推荐/默认模式）**：清晰紧凑，**仅输出请求/应答 URL、方法、状态码、模型名称、耗时、Token/Chunk 统计**，**杜绝打印具体的请求体、Prompt 与消息正文**，既保护隐私又避免控制台刷屏。
 - **`DEBUG` 级别（排错模式）**：输出完整的请求头、请求 JSON 参数明细、完整应答体或 SSE 完整流式文本聚合。
 - **流式 SSE 深度统计**：实时统计流式事件块数（Chunks）、工具调用识别与精准耗时（ms）。
-- **双路输出与持久化**：同时输出到控制台与 [adapter.log](file:///d:/Program/AI/copilot-openai-adapter/adapter.log)（支持 UTF-8 编码、自动按 10MB 轮转备份）。
+- **双路输出与持久化**：同时输出到控制台与 [adapter.log](file:///adapter.log)（支持 UTF-8 编码、自动按 10MB 轮转备份）。
 
 ### 4. 完全实现 OpenAI 模型接口（满足题目要求）
 - `GET /models` 与 `GET /v1/models`：动态拉取 Gemini 官方支持的模型列表，并补充标准别名（如 `gpt-4o`、`gpt-4-turbo` 等）。
@@ -130,7 +130,7 @@ start.bat
 ```bash
 python server.py --host 0.0.0.0 --port 8000
 ```
-*(如果环境中有多个 Python 版本，可指定实际路径执行，如：`C:\Users\Brilliance\AppData\Local\Python\bin\python.exe server.py`)*
+*(如果环境中有多个 Python 版本，可指定实际路径执行，如：`%LOCALAPPDATA%\Python\bin\python.exe server.py`)*
 
 启动成功后，控制台输出如下：
 ```text
@@ -144,7 +144,7 @@ python server.py --host 0.0.0.0 --port 8000
  Listening Address  : http://0.0.0.0:8000
  OpenAI Base URL    : http://127.0.0.1:8000/v1
  Models Endpoint    : http://127.0.0.1:8000/v1/models
- Log File           : D:\Program\AI\copilot-openai-adapter\adapter.log
+ Log File           : %LOCALAPPDATA%\copilot-openai-adapter\adapter.log
 ============================================================
 ```
 
@@ -177,7 +177,7 @@ python server.py --host 0.0.0.0 --port 8000
 
 ## 自动化测试验证
 
-项目中提供了完整的端到端自动化测试脚本 [test_adapter.py](file:///d:/Program/AI/copilot-openai-adapter/test_adapter.py)：
+项目中提供了完整的端到端自动化测试脚本 [test_adapter.py](file:///test_adapter.py)：
 
 ```bash
 python test_adapter.py
@@ -197,7 +197,7 @@ python test_adapter.py
 
 ## 更新记录 (Changelog)
 
-完整历史与详细变更请参阅 [CHANGELOG.md](file:///d:/Program/AI/copilot-openai-adapter/CHANGELOG.md)。
+完整历史与详细变更请参阅 [CHANGELOG.md](file:///CHANGELOG.md)。
 
 | 版本 | 发布日期 | 核心变更摘要 |
 | :--- | :--- | :--- |
