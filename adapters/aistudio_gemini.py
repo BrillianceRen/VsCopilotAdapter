@@ -19,6 +19,17 @@ ALLOWED_SCHEMA_KEYS = {
     "properties", "required", "items", "minItems", "maxItems"
 }
 
+RETRYABLE_EXCEPTIONS = (
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.PoolTimeout,
+)
+
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
 
 def clean_json_schema(schema: Any) -> Any:
     """Sanitize JSON schema for Gemini's OpenAPI 3.0 specification."""
@@ -83,6 +94,26 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
             "EmkKZwFpFH0Tgww0EVtvrjwSiIUTzdJuHgz8Z9bQQRvg8NAPCDDu99KGgsoDkkslAa0Lv11QSZQ/"
             "QmXb29K1UVg6HF4WlJwE3U/FBDc0U1Oz577uRrFuwhj7myKra6bE21Ticl3YZ3Dr2Sw="
         )
+
+        # Resilient network and timeout configurations
+        self.timeout_seconds = float(os.getenv("GEMINI_TIMEOUT", "180.0"))
+        self.max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
+
+    def _create_client(self, timeout: Optional[httpx.Timeout] = None) -> httpx.AsyncClient:
+        """Create an httpx.AsyncClient with HTTP/2 enabled and resilient connection pooling."""
+        if timeout is None:
+            timeout = httpx.Timeout(
+                self.timeout_seconds,
+                connect=25.0,
+                read=self.timeout_seconds,
+                write=60.0,
+                pool=30.0,
+            )
+        limits = httpx.Limits(max_keepalive_connections=10, max_connections=30, keepalive_expiry=60.0)
+        try:
+            return httpx.AsyncClient(http2=True, timeout=timeout, limits=limits)
+        except Exception:
+            return httpx.AsyncClient(http2=False, timeout=timeout, limits=limits)
 
     @property
     def provider_name(self) -> str:
@@ -327,7 +358,7 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
         models_data = []
 
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with self._create_client(httpx.Timeout(15.0, connect=10.0)) as client:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -472,81 +503,107 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
         generate_url = f"{self.base_url}/models/{target_model}:generateContent"
         headers = {"x-goog-api-key": api_key}
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(generate_url, json=payload, headers=headers)
-            if resp.status_code != 200:
-                logger.error(f"Gemini API returned error: {resp.status_code} {resp.text}")
+        for attempt in range(self.max_retries):
+            try:
+                async with self._create_client() as client:
+                    resp = await client.post(generate_url, json=payload, headers=headers)
+                    if resp.status_code in RETRYABLE_STATUS_CODES and attempt < self.max_retries - 1:
+                        retry_wait = 2.0 if resp.status_code == 429 else (1.0 * (2 ** attempt))
+                        logger.warning(
+                            f"Gemini API returned retryable status {resp.status_code}, retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
+                        )
+                        await asyncio.sleep(retry_wait)
+                        continue
+
+                    if resp.status_code != 200:
+                        logger.error(f"Gemini API returned error: {resp.status_code} {resp.text}")
+                        return {
+                            "error": {
+                                "message": f"Gemini API error: {resp.text}",
+                                "type": "invalid_request_error",
+                                "code": resp.status_code,
+                            }
+                        }
+
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    completion_text = ""
+                    tool_calls_out = []
+                    finish_reason = "stop"
+
+                    if candidates:
+                        cand = candidates[0]
+                        parts = cand.get("content", {}).get("parts", [])
+                        for p in parts:
+                            if "text" in p and p["text"]:
+                                completion_text += p["text"]
+                            elif "functionCall" in p:
+                                fn_call = p["functionCall"]
+                                call_id = fn_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+                                thought_sig = p.get("thoughtSignature")
+                                if thought_sig and call_id:
+                                    self._call_signatures[call_id] = thought_sig
+                                tool_calls_out.append({
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": fn_call.get("name", ""),
+                                        "arguments": json.dumps(fn_call.get("args", {}), ensure_ascii=False)
+                                    }
+                                })
+
+                        g_finish = cand.get("finishReason")
+                        if tool_calls_out or (g_finish == "STOP" and tool_calls_out):
+                            finish_reason = "tool_calls"
+                        elif g_finish and g_finish == "MAX_TOKENS":
+                            finish_reason = "length"
+
+                    usage_meta = data.get("usageMetadata", {})
+                    prompt_tokens = usage_meta.get("promptTokenCount", 0)
+                    completion_tokens = usage_meta.get("candidatesTokenCount", 0)
+                    total_tokens = usage_meta.get("totalTokenCount", prompt_tokens + completion_tokens)
+
+                    choice_message: Dict[str, Any] = {
+                        "role": "assistant",
+                        "content": completion_text if (not tool_calls_out or completion_text) else None,
+                    }
+                    if tool_calls_out:
+                        choice_message["tool_calls"] = tool_calls_out
+
+                    return {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": req.model or target_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": choice_message,
+                                "finish_reason": finish_reason,
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
+                        },
+                    }
+            except RETRYABLE_EXCEPTIONS as exc:
+                if attempt < self.max_retries - 1:
+                    retry_wait = 1.0 * (2 ** attempt)
+                    logger.warning(
+                        f"Gemini API connection error ({type(exc).__name__}: {exc}), retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
+                    )
+                    await asyncio.sleep(retry_wait)
+                    continue
+                logger.error(f"Gemini API connection failed after {self.max_retries} attempts: {exc}")
                 return {
                     "error": {
-                        "message": f"Gemini API error: {resp.text}",
-                        "type": "invalid_request_error",
-                        "code": resp.status_code,
+                        "message": f"Gemini API connection failed: {str(exc)}",
+                        "type": "connection_error",
+                        "code": 502,
                     }
                 }
-
-            data = resp.json()
-            candidates = data.get("candidates", [])
-            completion_text = ""
-            tool_calls_out = []
-            finish_reason = "stop"
-
-            if candidates:
-                cand = candidates[0]
-                parts = cand.get("content", {}).get("parts", [])
-                for p in parts:
-                    if "text" in p and p["text"]:
-                        completion_text += p["text"]
-                    elif "functionCall" in p:
-                        fn_call = p["functionCall"]
-                        call_id = fn_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
-                        thought_sig = p.get("thoughtSignature")
-                        if thought_sig and call_id:
-                            self._call_signatures[call_id] = thought_sig
-                        tool_calls_out.append({
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": fn_call.get("name", ""),
-                                "arguments": json.dumps(fn_call.get("args", {}), ensure_ascii=False)
-                            }
-                        })
-
-                g_finish = cand.get("finishReason")
-                if tool_calls_out or (g_finish == "STOP" and tool_calls_out):
-                    finish_reason = "tool_calls"
-                elif g_finish and g_finish == "MAX_TOKENS":
-                    finish_reason = "length"
-
-            usage_meta = data.get("usageMetadata", {})
-            prompt_tokens = usage_meta.get("promptTokenCount", 0)
-            completion_tokens = usage_meta.get("candidatesTokenCount", 0)
-            total_tokens = usage_meta.get("totalTokenCount", prompt_tokens + completion_tokens)
-
-            choice_message: Dict[str, Any] = {
-                "role": "assistant",
-                "content": completion_text if (not tool_calls_out or completion_text) else None,
-            }
-            if tool_calls_out:
-                choice_message["tool_calls"] = tool_calls_out
-
-            return {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": req.model or target_model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": choice_message,
-                        "finish_reason": finish_reason,
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                },
-            }
 
     async def chat_completions_stream(self, req: Any, api_key: str) -> AsyncGenerator[str, None]:
         """Handle streaming chat completions yielding OpenAI SSE lines."""
@@ -585,7 +642,7 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created_time = int(time.time())
 
-        # Initial chunk with role
+        # Prepared initial chunk with role
         initial_chunk = {
             "id": chat_id,
             "object": "chat.completion.chunk",
@@ -599,170 +656,211 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
                 }
             ],
         }
-        yield f"data: {json.dumps(initial_chunk)}\n\n"
 
-        timeout = httpx.Timeout(120.0, connect=15.0)
         headers = {"x-goog-api-key": api_key}
         has_tool_call = False
         tool_call_index = 0
+        initial_chunk_sent = False
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(self.max_retries):
             try:
-                async with client.stream("POST", stream_url, json=payload, headers=headers) as response:
-                    if response.status_code != 200:
-                        err_text = await response.aread()
-                        logger.error(f"Gemini streaming error ({response.status_code}): {err_text.decode('utf-8', errors='ignore')}")
-                        err_chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": req.model or target_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": f"\n[Error from Gemini: {response.status_code}]"},
-                                    "finish_reason": "stop",
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(err_chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-
-                    async for line in response.aiter_lines():
-                        if not line:
+                async with self._create_client() as client:
+                    async with client.stream("POST", stream_url, json=payload, headers=headers) as response:
+                        if response.status_code in RETRYABLE_STATUS_CODES and not initial_chunk_sent and attempt < self.max_retries - 1:
+                            retry_wait = 2.0 if response.status_code == 429 else (1.0 * (2 ** attempt))
+                            logger.warning(
+                                f"Gemini streaming returned retryable status {response.status_code}, retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
+                            )
+                            await asyncio.sleep(retry_wait)
                             continue
-                        if line.startswith("data:"):
-                            raw_data = line[5:].strip()
-                            if not raw_data:
+
+                        if response.status_code != 200:
+                            err_text = await response.aread()
+                            logger.error(f"Gemini streaming error ({response.status_code}): {err_text.decode('utf-8', errors='ignore')}")
+                            if not initial_chunk_sent:
+                                yield f"data: {json.dumps(initial_chunk)}\n\n"
+                                initial_chunk_sent = True
+                            err_chunk = {
+                                "id": chat_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": req.model or target_model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": f"\n[Error from Gemini: {response.status_code}]"},
+                                        "finish_reason": "stop",
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(err_chunk)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+
+                        async for line in response.aiter_lines():
+                            if not line:
                                 continue
-                            try:
-                                gemini_chunk = json.loads(raw_data)
-                                candidates = gemini_chunk.get("candidates", [])
-                                if candidates:
-                                    cand = candidates[0]
-                                    parts = cand.get("content", {}).get("parts", [])
-                                    finish_reason = cand.get("finishReason")
-                                    finish_message = cand.get("finishMessage", "")
+                            if line.startswith("data:"):
+                                raw_data = line[5:].strip()
+                                if not raw_data:
+                                    continue
+                                try:
+                                    gemini_chunk = json.loads(raw_data)
+                                    candidates = gemini_chunk.get("candidates", [])
+                                    if candidates:
+                                        cand = candidates[0]
+                                        parts = cand.get("content", {}).get("parts", [])
+                                        finish_reason = cand.get("finishReason")
+                                        finish_message = cand.get("finishMessage", "")
 
-                                    for part in parts:
-                                        # 1. Text delta
-                                        if "text" in part and part["text"]:
-                                            chunk_payload = {
-                                                "id": chat_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created_time,
-                                                "model": req.model or target_model,
-                                                "choices": [
-                                                    {
-                                                        "index": 0,
-                                                        "delta": {"content": part["text"]},
-                                                        "finish_reason": None,
-                                                    }
-                                                ],
-                                            }
-                                            yield f"data: {json.dumps(chunk_payload)}\n\n"
+                                        for part in parts:
+                                            # 1. Text delta
+                                            if "text" in part and part["text"]:
+                                                if not initial_chunk_sent:
+                                                    yield f"data: {json.dumps(initial_chunk)}\n\n"
+                                                    initial_chunk_sent = True
 
-                                        # 2. Tool / Function call delta
-                                        elif "functionCall" in part:
-                                            has_tool_call = True
-                                            fn_call = part["functionCall"]
-                                            fn_name = fn_call.get("name", "")
-                                            fn_args = fn_call.get("args", {})
-                                            call_id = fn_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
-                                            thought_sig = part.get("thoughtSignature")
-                                            if thought_sig and call_id:
-                                                self._call_signatures[call_id] = thought_sig
-
-                                            tool_chunk = {
-                                                "id": chat_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created_time,
-                                                "model": req.model or target_model,
-                                                "choices": [
-                                                    {
-                                                        "index": 0,
-                                                        "delta": {
-                                                            "tool_calls": [
-                                                                {
-                                                                    "index": tool_call_index,
-                                                                    "id": call_id,
-                                                                    "type": "function",
-                                                                    "function": {
-                                                                        "name": fn_name,
-                                                                        "arguments": json.dumps(fn_args, ensure_ascii=False)
-                                                                    }
-                                                                }
-                                                            ]
-                                                        },
-                                                        "finish_reason": None,
-                                                    }
-                                                ],
-                                            }
-                                            tool_call_index += 1
-                                            yield f"data: {json.dumps(tool_chunk)}\n\n"
-
-                                    # Fallback rescue for MALFORMED_FUNCTION_CALL
-                                    if finish_reason == "MALFORMED_FUNCTION_CALL" and not has_tool_call and finish_message:
-                                        m = re.search(r"call:([a-zA-Z0-9_\-]+)\s*(\{.*\})", finish_message, re.DOTALL)
-                                        if m:
-                                            has_tool_call = True
-                                            fn_name, fn_args_str = m.groups()
-                                            call_id = f"call_{uuid.uuid4().hex[:12]}"
-                                            tool_chunk = {
-                                                "id": chat_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created_time,
-                                                "model": req.model or target_model,
-                                                "choices": [
-                                                    {
-                                                        "index": 0,
-                                                        "delta": {
-                                                            "tool_calls": [
-                                                                {
-                                                                    "index": tool_call_index,
-                                                                    "id": call_id,
-                                                                    "type": "function",
-                                                                    "function": {
-                                                                        "name": fn_name,
-                                                                        "arguments": fn_args_str
-                                                                    }
-                                                                }
-                                                            ]
-                                                        },
-                                                        "finish_reason": None,
-                                                    }
-                                                ],
-                                            }
-                                            yield f"data: {json.dumps(tool_chunk)}\n\n"
-
-                                    if finish_reason and finish_reason != "FINISH_REASON_UNSPECIFIED":
-                                        openai_finish = "tool_calls" if has_tool_call else "stop"
-                                        if finish_reason == "MAX_TOKENS":
-                                            openai_finish = "length"
-
-                                        stop_chunk = {
-                                            "id": chat_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": created_time,
-                                            "model": req.model or target_model,
-                                            "choices": [
-                                                {
-                                                    "index": 0,
-                                                    "delta": {},
-                                                    "finish_reason": openai_finish,
+                                                chunk_payload = {
+                                                    "id": chat_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": created_time,
+                                                    "model": req.model or target_model,
+                                                    "choices": [
+                                                        {
+                                                            "index": 0,
+                                                            "delta": {"content": part["text"]},
+                                                            "finish_reason": None,
+                                                        }
+                                                    ],
                                                 }
-                                            ],
-                                        }
-                                        yield f"data: {json.dumps(stop_chunk)}\n\n"
-                            except json.JSONDecodeError:
-                                continue
+                                                yield f"data: {json.dumps(chunk_payload)}\n\n"
+
+                                            # 2. Tool / Function call delta
+                                            elif "functionCall" in part:
+                                                if not initial_chunk_sent:
+                                                    yield f"data: {json.dumps(initial_chunk)}\n\n"
+                                                    initial_chunk_sent = True
+
+                                                has_tool_call = True
+                                                fn_call = part["functionCall"]
+                                                fn_name = fn_call.get("name", "")
+                                                fn_args = fn_call.get("args", {})
+                                                call_id = fn_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+                                                thought_sig = part.get("thoughtSignature")
+                                                if thought_sig and call_id:
+                                                    self._call_signatures[call_id] = thought_sig
+
+                                                tool_chunk = {
+                                                    "id": chat_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": created_time,
+                                                    "model": req.model or target_model,
+                                                    "choices": [
+                                                        {
+                                                            "index": 0,
+                                                            "delta": {
+                                                                "tool_calls": [
+                                                                    {
+                                                                        "index": tool_call_index,
+                                                                        "id": call_id,
+                                                                        "type": "function",
+                                                                        "function": {
+                                                                            "name": fn_name,
+                                                                            "arguments": json.dumps(fn_args, ensure_ascii=False)
+                                                                        }
+                                                                    }
+                                                                ]
+                                                            },
+                                                            "finish_reason": None,
+                                                        }
+                                                    ],
+                                                }
+                                                tool_call_index += 1
+                                                yield f"data: {json.dumps(tool_chunk)}\n\n"
+
+                                        # Fallback rescue for MALFORMED_FUNCTION_CALL
+                                        if finish_reason == "MALFORMED_FUNCTION_CALL" and not has_tool_call and finish_message:
+                                            m = re.search(r"call:([a-zA-Z0-9_\-]+)\s*(\{.*\})", finish_message, re.DOTALL)
+                                            if m:
+                                                if not initial_chunk_sent:
+                                                    yield f"data: {json.dumps(initial_chunk)}\n\n"
+                                                    initial_chunk_sent = True
+
+                                                has_tool_call = True
+                                                fn_name, fn_args_str = m.groups()
+                                                call_id = f"call_{uuid.uuid4().hex[:12]}"
+                                                tool_chunk = {
+                                                    "id": chat_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": created_time,
+                                                    "model": req.model or target_model,
+                                                    "choices": [
+                                                        {
+                                                            "index": 0,
+                                                            "delta": {
+                                                                "tool_calls": [
+                                                                    {
+                                                                        "index": tool_call_index,
+                                                                        "id": call_id,
+                                                                        "type": "function",
+                                                                        "function": {
+                                                                            "name": fn_name,
+                                                                            "arguments": fn_args_str
+                                                                        }
+                                                                    }
+                                                                ]
+                                                            },
+                                                            "finish_reason": None,
+                                                        }
+                                                    ],
+                                                }
+                                                yield f"data: {json.dumps(tool_chunk)}\n\n"
+
+                                        if finish_reason and finish_reason != "FINISH_REASON_UNSPECIFIED":
+                                            if not initial_chunk_sent:
+                                                yield f"data: {json.dumps(initial_chunk)}\n\n"
+                                                initial_chunk_sent = True
+
+                                            openai_finish = "tool_calls" if has_tool_call else "stop"
+                                            if finish_reason == "MAX_TOKENS":
+                                                openai_finish = "length"
+
+                                            stop_chunk = {
+                                                "id": chat_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created_time,
+                                                "model": req.model or target_model,
+                                                "choices": [
+                                                    {
+                                                        "index": 0,
+                                                        "delta": {},
+                                                        "finish_reason": openai_finish,
+                                                    }
+                                                ],
+                                            }
+                                            yield f"data: {json.dumps(stop_chunk)}\n\n"
+                                except json.JSONDecodeError:
+                                    continue
+
+                # Stream completed normally
+                break
 
             except asyncio.CancelledError:
                 logger.info("SSE generator cancelled by client.")
                 raise
-            except Exception as exc:
+            except RETRYABLE_EXCEPTIONS as exc:
+                if not initial_chunk_sent and attempt < self.max_retries - 1:
+                    retry_wait = 1.0 * (2 ** attempt)
+                    logger.warning(
+                        f"Upstream stream connection dropped ({type(exc).__name__}: {exc}), retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
+                    )
+                    await asyncio.sleep(retry_wait)
+                    continue
+
                 logger.error(f"Exception during SSE stream: {type(exc).__name__}: {exc}")
+                if not initial_chunk_sent:
+                    yield f"data: {json.dumps(initial_chunk)}\n\n"
+                    initial_chunk_sent = True
                 err_chunk = {
                     "id": chat_id,
                     "object": "chat.completion.chunk",
@@ -777,11 +875,43 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
                     ],
                 }
                 yield f"data: {json.dumps(err_chunk)}\n\n"
+                break
+            except Exception as exc:
+                logger.error(f"Unexpected exception during SSE stream: {type(exc).__name__}: {exc}")
+                if not initial_chunk_sent:
+                    yield f"data: {json.dumps(initial_chunk)}\n\n"
+                    initial_chunk_sent = True
+                err_chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": req.model or target_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": f"\n[Stream Error: {str(exc)}]"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(err_chunk)}\n\n"
+                break
+
+        if not initial_chunk_sent:
+            yield f"data: {json.dumps(initial_chunk)}\n\n"
+            stop_chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": req.model or target_model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(stop_chunk)}\n\n"
 
         yield "data: [DONE]\n\n"
 
     async def completions(self, req: Any, api_key: str) -> Dict[str, Any]:
-        """Handle legacy code completions (inline/FIM)."""
+        """Handle legacy code completions (inline/FIM) with automatic retry on transient errors."""
         target_model = self.map_model_name(req.model or self.default_model)
         prompt_text = req.prompt if isinstance(req.prompt, str) else "\n".join(req.prompt)
         if req.suffix:
@@ -812,68 +942,101 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
 
         generate_url = f"{self.base_url}/models/{target_model}:generateContent"
         headers = {"x-goog-api-key": api_key}
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(generate_url, json=payload, headers=headers)
-            if resp.status_code != 200:
-                return {
-                    "error": {
-                        "message": f"Gemini error: {resp.text}",
-                        "type": "invalid_request_error",
-                    }
-                }
 
-            data = resp.json()
-            candidates = data.get("candidates", [])
-            text = ""
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                for p in parts:
-                    if "text" in p:
-                        text += p["text"]
+        for attempt in range(self.max_retries):
+            try:
+                async with self._create_client() as client:
+                    resp = await client.post(generate_url, json=payload, headers=headers)
+                    if resp.status_code in RETRYABLE_STATUS_CODES and attempt < self.max_retries - 1:
+                        retry_wait = 2.0 if resp.status_code == 429 else (1.0 * (2 ** attempt))
+                        logger.warning(
+                            f"Gemini completions returned retryable status {resp.status_code}, retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
+                        )
+                        await asyncio.sleep(retry_wait)
+                        continue
 
-            return {
-                "id": f"cmpl-{uuid.uuid4().hex[:12]}",
-                "object": "text_completion",
-                "created": int(time.time()),
-                "model": req.model or target_model,
-                "choices": [
-                    {
-                        "text": text,
-                        "index": 0,
-                        "logprobs": None,
-                        "finish_reason": "stop",
+                    if resp.status_code != 200:
+                        return {
+                            "error": {
+                                "message": f"Gemini error: {resp.text}",
+                                "type": "invalid_request_error",
+                            }
+                        }
+
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    text = ""
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        for p in parts:
+                            if "text" in p:
+                                text += p["text"]
+
+                    return {
+                        "id": f"cmpl-{uuid.uuid4().hex[:12]}",
+                        "object": "text_completion",
+                        "created": int(time.time()),
+                        "model": req.model or target_model,
+                        "choices": [
+                            {
+                                "text": text,
+                                "index": 0,
+                                "logprobs": None,
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": len(prompt_text) // 4,
+                            "completion_tokens": len(text) // 4,
+                            "total_tokens": (len(prompt_text) + len(text)) // 4,
+                        },
                     }
-                ],
-                "usage": {
-                    "prompt_tokens": len(prompt_text) // 4,
-                    "completion_tokens": len(text) // 4,
-                    "total_tokens": (len(prompt_text) + len(text)) // 4,
-                },
-            }
+            except RETRYABLE_EXCEPTIONS as exc:
+                if attempt < self.max_retries - 1:
+                    retry_wait = 1.0 * (2 ** attempt)
+                    logger.warning(
+                        f"Gemini completions connection error ({type(exc).__name__}: {exc}), retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
+                    )
+                    await asyncio.sleep(retry_wait)
+                    continue
+                return {"error": {"message": f"Gemini completion connection failed: {str(exc)}"}}
 
     async def embeddings(self, req: Any, api_key: str) -> Dict[str, Any]:
-        """Handle embeddings requests."""
+        """Handle embeddings requests with automatic retry on transient errors."""
         target_model = "gemini-embedding-001"
         texts = [req.input] if isinstance(req.input, str) else req.input
         embed_url = f"{self.base_url}/models/{target_model}:embedContent"
         headers = {"x-goog-api-key": api_key}
 
         results = []
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for idx, text in enumerate(texts):
-                payload = {"content": {"parts": [{"text": text}]}}
-                resp = await client.post(embed_url, json=payload, headers=headers)
-                if resp.status_code == 200:
-                    values = resp.json().get("embedding", {}).get("values", [])
-                    results.append(
-                        {
-                            "object": "embedding",
-                            "index": idx,
-                            "embedding": values,
-                        }
-                    )
-                else:
-                    return {"error": {"message": f"Embedding error: {resp.text}"}}
+        for idx, text in enumerate(texts):
+            payload = {"content": {"parts": [{"text": text}]}}
+            success = False
+            for attempt in range(self.max_retries):
+                try:
+                    async with self._create_client() as client:
+                        resp = await client.post(embed_url, json=payload, headers=headers)
+                        if resp.status_code in RETRYABLE_STATUS_CODES and attempt < self.max_retries - 1:
+                            await asyncio.sleep(1.0 * (2 ** attempt))
+                            continue
+                        if resp.status_code == 200:
+                            values = resp.json().get("embedding", {}).get("values", [])
+                            results.append(
+                                {
+                                    "object": "embedding",
+                                    "index": idx,
+                                    "embedding": values,
+                                }
+                            )
+                            success = True
+                            break
+                        else:
+                            return {"error": {"message": f"Embedding error: {resp.text}"}}
+                except RETRYABLE_EXCEPTIONS as exc:
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep(1.0 * (2 ** attempt))
+                        continue
+                    return {"error": {"message": f"Embedding connection error: {str(exc)}"}}
 
         return {
             "object": "list",
