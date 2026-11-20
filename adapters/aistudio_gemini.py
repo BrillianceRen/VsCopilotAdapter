@@ -8,6 +8,7 @@ import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 import httpx
+import httpcore
 from fastapi.responses import JSONResponse
 
 from .base import BaseAIAdapter
@@ -20,12 +21,14 @@ ALLOWED_SCHEMA_KEYS = {
 }
 
 RETRYABLE_EXCEPTIONS = (
-    httpx.RemoteProtocolError,
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
-    httpx.ReadTimeout,
-    httpx.WriteError,
-    httpx.PoolTimeout,
+    httpx.TransportError,
+    httpcore.NetworkError,
+    httpcore.TimeoutException,
+    httpcore.ProtocolError,
+    httpcore.ProxyError,
+    ConnectionError,
+    TimeoutError,
+    asyncio.TimeoutError,
 )
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -99,21 +102,25 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
         self.timeout_seconds = float(os.getenv("GEMINI_TIMEOUT", "180.0"))
         self.max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
 
-    def _create_client(self, timeout: Optional[httpx.Timeout] = None) -> httpx.AsyncClient:
-        """Create an httpx.AsyncClient with HTTP/2 enabled and resilient connection pooling."""
+    def _create_client(
+        self, timeout: Optional[httpx.Timeout] = None, http2: bool = True
+    ) -> httpx.AsyncClient:
+        """Create an httpx.AsyncClient with configurable HTTP/2 and resilient connection pooling."""
         if timeout is None:
             timeout = httpx.Timeout(
                 self.timeout_seconds,
-                connect=25.0,
+                connect=30.0,
                 read=self.timeout_seconds,
                 write=60.0,
                 pool=30.0,
             )
         limits = httpx.Limits(max_keepalive_connections=10, max_connections=30, keepalive_expiry=60.0)
-        try:
-            return httpx.AsyncClient(http2=True, timeout=timeout, limits=limits)
-        except Exception:
-            return httpx.AsyncClient(http2=False, timeout=timeout, limits=limits)
+        if http2:
+            try:
+                return httpx.AsyncClient(http2=True, timeout=timeout, limits=limits)
+            except Exception:
+                pass
+        return httpx.AsyncClient(http2=False, timeout=timeout, limits=limits)
 
     @property
     def provider_name(self) -> str:
@@ -504,8 +511,9 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
         headers = {"x-goog-api-key": api_key}
 
         for attempt in range(self.max_retries):
+            use_http2 = (attempt % 2 == 0)
             try:
-                async with self._create_client() as client:
+                async with self._create_client(http2=use_http2) as client:
                     resp = await client.post(generate_url, json=payload, headers=headers)
                     if resp.status_code in RETRYABLE_STATUS_CODES and attempt < self.max_retries - 1:
                         retry_wait = 2.0 if resp.status_code == 429 else (1.0 * (2 ** attempt))
@@ -589,17 +597,19 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
                         },
                     }
             except RETRYABLE_EXCEPTIONS as exc:
+                exc_desc = f"{type(exc).__name__}: {exc}".strip() if str(exc).strip() else type(exc).__name__
                 if attempt < self.max_retries - 1:
                     retry_wait = 1.0 * (2 ** attempt)
+                    proto_info = "HTTP/2" if use_http2 else "HTTP/1.1"
                     logger.warning(
-                        f"Gemini API connection error ({type(exc).__name__}: {exc}), retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
+                        f"Gemini API connection error via {proto_info} ({exc_desc}), retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
                     )
                     await asyncio.sleep(retry_wait)
                     continue
-                logger.error(f"Gemini API connection failed after {self.max_retries} attempts: {exc}")
+                logger.error(f"Gemini API connection failed after {self.max_retries} attempts: {exc_desc}")
                 return {
                     "error": {
-                        "message": f"Gemini API connection failed: {str(exc)}",
+                        "message": f"Gemini API connection failed: {exc_desc}",
                         "type": "connection_error",
                         "code": 502,
                     }
@@ -663,8 +673,9 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
         initial_chunk_sent = False
 
         for attempt in range(self.max_retries):
+            use_http2 = (attempt % 2 == 0)
             try:
-                async with self._create_client() as client:
+                async with self._create_client(http2=use_http2) as client:
                     async with client.stream("POST", stream_url, json=payload, headers=headers) as response:
                         if response.status_code in RETRYABLE_STATUS_CODES and not initial_chunk_sent and attempt < self.max_retries - 1:
                             retry_wait = 2.0 if response.status_code == 429 else (1.0 * (2 ** attempt))
@@ -849,52 +860,75 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
                 logger.info("SSE generator cancelled by client.")
                 raise
             except RETRYABLE_EXCEPTIONS as exc:
+                exc_desc = f"{type(exc).__name__}: {exc}".strip() if str(exc).strip() else type(exc).__name__
                 if not initial_chunk_sent and attempt < self.max_retries - 1:
                     retry_wait = 1.0 * (2 ** attempt)
+                    proto_info = "HTTP/2" if use_http2 else "HTTP/1.1"
                     logger.warning(
-                        f"Upstream stream connection dropped ({type(exc).__name__}: {exc}), retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
+                        f"Upstream stream connection dropped via {proto_info} ({exc_desc}), retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
                     )
                     await asyncio.sleep(retry_wait)
                     continue
 
-                logger.error(f"Exception during SSE stream: {type(exc).__name__}: {exc}")
-                if not initial_chunk_sent:
-                    yield f"data: {json.dumps(initial_chunk)}\n\n"
-                    initial_chunk_sent = True
-                err_chunk = {
-                    "id": chat_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": req.model or target_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": f"\n[Stream Error: {str(exc)}]"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(err_chunk)}\n\n"
+                logger.error(f"Exception during SSE stream: {exc_desc}")
+                if has_tool_call:
+                    stop_chunk = {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": req.model or target_model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    }
+                    yield f"data: {json.dumps(stop_chunk)}\n\n"
+                else:
+                    if not initial_chunk_sent:
+                        yield f"data: {json.dumps(initial_chunk)}\n\n"
+                        initial_chunk_sent = True
+                    err_chunk = {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": req.model or target_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": f"\n[Stream Error: {exc_desc}]"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(err_chunk)}\n\n"
                 break
             except Exception as exc:
-                logger.error(f"Unexpected exception during SSE stream: {type(exc).__name__}: {exc}")
-                if not initial_chunk_sent:
-                    yield f"data: {json.dumps(initial_chunk)}\n\n"
-                    initial_chunk_sent = True
-                err_chunk = {
-                    "id": chat_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": req.model or target_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": f"\n[Stream Error: {str(exc)}]"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(err_chunk)}\n\n"
+                exc_desc = f"{type(exc).__name__}: {exc}".strip() if str(exc).strip() else type(exc).__name__
+                logger.error(f"Unexpected exception during SSE stream: {exc_desc}")
+                if has_tool_call:
+                    stop_chunk = {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": req.model or target_model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    }
+                    yield f"data: {json.dumps(stop_chunk)}\n\n"
+                else:
+                    if not initial_chunk_sent:
+                        yield f"data: {json.dumps(initial_chunk)}\n\n"
+                        initial_chunk_sent = True
+                    err_chunk = {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": req.model or target_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": f"\n[Stream Error: {exc_desc}]"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(err_chunk)}\n\n"
                 break
 
         if not initial_chunk_sent:
@@ -944,8 +978,9 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
         headers = {"x-goog-api-key": api_key}
 
         for attempt in range(self.max_retries):
+            use_http2 = (attempt % 2 == 0)
             try:
-                async with self._create_client() as client:
+                async with self._create_client(http2=use_http2) as client:
                     resp = await client.post(generate_url, json=payload, headers=headers)
                     if resp.status_code in RETRYABLE_STATUS_CODES and attempt < self.max_retries - 1:
                         retry_wait = 2.0 if resp.status_code == 429 else (1.0 * (2 ** attempt))
@@ -992,14 +1027,16 @@ class AIStudioGeminiAdapter(BaseAIAdapter):
                         },
                     }
             except RETRYABLE_EXCEPTIONS as exc:
+                exc_desc = f"{type(exc).__name__}: {exc}".strip() if str(exc).strip() else type(exc).__name__
                 if attempt < self.max_retries - 1:
                     retry_wait = 1.0 * (2 ** attempt)
+                    proto_info = "HTTP/2" if use_http2 else "HTTP/1.1"
                     logger.warning(
-                        f"Gemini completions connection error ({type(exc).__name__}: {exc}), retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
+                        f"Gemini completions connection error via {proto_info} ({exc_desc}), retrying attempt {attempt + 1}/{self.max_retries} in {retry_wait:.1f}s..."
                     )
                     await asyncio.sleep(retry_wait)
                     continue
-                return {"error": {"message": f"Gemini completion connection failed: {str(exc)}"}}
+                return {"error": {"message": f"Gemini completion connection failed: {exc_desc}"}}
 
     async def embeddings(self, req: Any, api_key: str) -> Dict[str, Any]:
         """Handle embeddings requests with automatic retry on transient errors."""
