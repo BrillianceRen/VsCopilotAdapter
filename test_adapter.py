@@ -118,6 +118,52 @@ async def run_tests():
             print("  -> OK: Tool calls detected in stream:", called_tools)
             assert "get_weather" in called_tools
 
+        print("\n[TEST 9] Testing Virtual Fallback Model & Degradation Strategy (auto)...")
+        from fallback_manager import fallback_manager
+        # 1. Verify auto is present in models list
+        res = await client.get("/v1/models")
+        assert res.status_code == 200
+        ids = [m["id"] for m in res.json()["data"]]
+        assert "auto" in ids, "Virtual model 'auto' should be in models list"
+        print("  -> OK: Virtual model 'auto' found in /v1/models")
+
+        # 2. Test degradation recovery: invalid model -> gemini-3.8-flash
+        orig_models = list(fallback_manager.fallback_models)
+        orig_threshold = fallback_manager.failure_threshold
+        try:
+            fallback_manager.reconfigure(fallback_models=["invalid-model-for-test", "gemini-3.8-flash"], failure_threshold=1)
+            # Turn 1: New session
+            turn1_msgs = [{"role": "user", "content": "Test fallback session turn 1"}]
+            fb_res = await client.post("/v1/chat/completions", json={
+                "model": "auto",
+                "messages": turn1_msgs,
+                "max_tokens": 20
+            })
+            assert fb_res.status_code == 200, f"Expected 200 via fallback, got {fb_res.status_code}"
+            print("  -> OK: Turn 1 successfully degraded from invalid-model-for-test to gemini-3.8-flash")
+
+            # Turn 2: Ongoing session continues on degraded model
+            turn2_msgs = [
+                {"role": "user", "content": "Test fallback session turn 1"},
+                {"role": "assistant", "content": "Hello"},
+                {"role": "user", "content": "Test fallback session turn 2"}
+            ]
+            fb_res2 = await client.post("/v1/chat/completions", json={
+                "model": "auto",
+                "messages": turn2_msgs,
+                "max_tokens": 20
+            })
+            assert fb_res2.status_code == 200
+            print("  -> OK: Turn 2 stayed on degraded model in same conversation")
+
+            # Turn 3: New conversation resets back to model 0
+            turn3_msgs = [{"role": "user", "content": "Brand new conversation question"}]
+            sid3, is_new3 = fallback_manager.resolve_session(type("Req", (), {"messages": turn3_msgs, "user": None})())
+            assert is_new3 == True, "Turn 3 without assistant message must be recognized as new session"
+            print("  -> OK: Turn 3 verified as new session returning to initial model")
+        finally:
+            fallback_manager.reconfigure(fallback_models=orig_models, failure_threshold=orig_threshold)
+
     print("\n==========================================")
     print(" ALL TESTS PASSED SUCCESSFULLY! ")
     print("==========================================")

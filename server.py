@@ -1,9 +1,11 @@
 import argparse
 import asyncio
+from datetime import datetime
 import json
 import logging
-from logging.handlers import RotatingFileHandler
+from logging.handlers import BaseRotatingHandler
 import os
+import re
 import sys
 import time
 import uuid
@@ -34,9 +36,130 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from adapters import BaseAIAdapter, get_adapter
+from fallback_manager import fallback_manager
 
-# Setup logging: console + rotating log file (10MB per file, 3 backups)
-LOG_FILE = os.getenv("LOG_FILE", "adapter.log")
+
+class DailySizeRotatingHandler(BaseRotatingHandler):
+    """
+    Rotating file handler that:
+    1. Stores log files in a dedicated directory (log_dir).
+    2. Rotates daily based on current local date (yyyy-MM-dd).
+    3. Names files in format: yyyy-MM-dd.##.log (e.g. 2026-11-23.01.log).
+    4. Enforces a maximum file size (default 30MB).
+    5. When file size reaches limit, increments the sequence number (e.g. .01.log -> .02.log).
+    """
+
+    def __init__(
+        self,
+        log_dir: str,
+        max_bytes: int = 30 * 1024 * 1024,
+        encoding: str = "utf-8",
+        delay: bool = False,
+    ):
+        self.log_dir = os.path.abspath(log_dir)
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.max_bytes = max_bytes
+        self.current_date = self._get_current_date()
+        self.current_seq = self._find_or_start_seq(self.current_date)
+        initial_file = self._build_filepath(self.current_date, self.current_seq)
+
+        super().__init__(initial_file, mode="a", encoding=encoding, delay=delay)
+
+    def _get_current_date(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _build_filepath(self, date_str: str, seq: int) -> str:
+        return os.path.join(self.log_dir, f"{date_str}.{seq:02d}.log")
+
+    def _find_or_start_seq(self, date_str: str) -> int:
+        """
+        Scan log_dir for existing files matching date_str.##.log.
+        If any exist, check if the latest one has space (< max_bytes).
+        If it has space, reuse it. Otherwise, increment seq.
+        If none exist, start at 1.
+        """
+        pattern = re.compile(rf"^{re.escape(date_str)}\.(\d+)\.log$")
+        existing_seqs = []
+        try:
+            for fname in os.listdir(self.log_dir):
+                m = pattern.match(fname)
+                if m:
+                    existing_seqs.append(int(m.group(1)))
+        except Exception:
+            pass
+
+        if not existing_seqs:
+            return 1
+
+        existing_seqs.sort()
+        latest_seq = existing_seqs[-1]
+        latest_path = self._build_filepath(date_str, latest_seq)
+        try:
+            if os.path.exists(latest_path) and os.path.getsize(latest_path) >= self.max_bytes:
+                return latest_seq + 1
+        except Exception:
+            pass
+        return latest_seq
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:
+        """
+        Determine if rollover should occur.
+        Rollover triggers when:
+        1. Date changed (new day -> reset to new date seq).
+        2. File size plus new formatted record exceeds max_bytes (-> next seq).
+        """
+        now_date = self._get_current_date()
+        if now_date != self.current_date:
+            return True
+
+        if self.max_bytes > 0:
+            if self.stream is None:
+                self.stream = self._open()
+            try:
+                pos = self.stream.tell()
+            except Exception:
+                try:
+                    pos = os.fstat(self.stream.fileno()).st_size
+                except Exception:
+                    pos = os.path.getsize(self.baseFilename) if os.path.exists(self.baseFilename) else 0
+
+            msg = "%s\n" % self.format(record)
+            msg_len = len(msg.encode(self.encoding or "utf-8", errors="replace"))
+            if pos > 0 and (pos + msg_len >= self.max_bytes):
+                return True
+
+        return False
+
+    def doRollover(self):
+        """
+        Execute rollover:
+        - Flush and close current stream.
+        - Advance date / seq.
+        - Open new file stream.
+        """
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        now_date = self._get_current_date()
+        if now_date != self.current_date:
+            self.current_date = now_date
+            self.current_seq = self._find_or_start_seq(now_date)
+        else:
+            self.current_seq += 1
+
+        self.baseFilename = self._build_filepath(self.current_date, self.current_seq)
+        if not self.delay:
+            self.stream = self._open()
+
+
+# Setup logging: console + daily rotating log files in specified directory (yyyy-MM-dd.##.log, max 30MB)
+LOG_DIR = os.getenv("LOG_DIR", os.getenv("LOG_FILE", "logs")).strip()
+if LOG_DIR.lower().endswith(".log"):
+    LOG_DIR = os.path.dirname(LOG_DIR) or "logs"
+
+MAX_LOG_SIZE_MB = int(os.getenv("MAX_LOG_SIZE_MB", "30"))
+MAX_LOG_BYTES = MAX_LOG_SIZE_MB * 1024 * 1024
 LOG_LEVEL_NAME = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 
 log_formatter = logging.Formatter(
@@ -50,16 +173,21 @@ logger = logging.getLogger("copilot-openai-adapter")
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(log_formatter)
 
-# File handler with UTF-8 encoding
-handlers = [console_handler]
+# Daily size-rotating file handler with UTF-8 encoding
+file_handler: Optional[DailySizeRotatingHandler] = None
 try:
-    file_handler = RotatingFileHandler(
-        LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    file_handler = DailySizeRotatingHandler(
+        log_dir=LOG_DIR,
+        max_bytes=MAX_LOG_BYTES,
+        encoding="utf-8",
     )
     file_handler.setFormatter(log_formatter)
-    handlers.append(file_handler)
 except Exception as e:
-    print(f"Warning: Failed to setup log file '{LOG_FILE}': {e}")
+    print(f"Warning: Failed to setup rotating log directory '{LOG_DIR}': {e}")
+
+handlers = [console_handler]
+if file_handler:
+    handlers.append(file_handler)
 
 
 def set_log_level(level_name: str):
@@ -68,6 +196,31 @@ def set_log_level(level_name: str):
     logger.setLevel(numeric_level)
     for h in logger.handlers:
         h.setLevel(numeric_level)
+
+
+def configure_log_handler(target_dir: str, max_mb: Optional[int] = None):
+    """Reconfigure or update rotating file handler with a new directory or size limit."""
+    global file_handler, LOG_DIR, MAX_LOG_SIZE_MB, MAX_LOG_BYTES
+    LOG_DIR = target_dir
+    if max_mb is not None:
+        MAX_LOG_SIZE_MB = max_mb
+        MAX_LOG_BYTES = MAX_LOG_SIZE_MB * 1024 * 1024
+
+    if file_handler and file_handler in logger.handlers:
+        logger.removeHandler(file_handler)
+        file_handler.close()
+
+    try:
+        file_handler = DailySizeRotatingHandler(
+            log_dir=LOG_DIR,
+            max_bytes=MAX_LOG_BYTES,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(log_formatter)
+        file_handler.setLevel(logger.level)
+        logger.addHandler(file_handler)
+    except Exception as e:
+        print(f"Warning: Failed to configure log handler for directory '{LOG_DIR}': {e}")
 
 
 if not logger.handlers:
@@ -397,6 +550,179 @@ async def root():
     }
 
 
+def analyze_stream_chunk(chunk: Union[str, bytes]) -> Tuple[bool, str, bool]:
+    """
+    Inspect a stream chunk.
+    Returns: (is_error, error_message, has_real_content)
+    """
+    try:
+        chunk_str = chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else str(chunk)
+        for line in chunk_str.splitlines():
+            line = line.strip()
+            if line.startswith("data:") and line[5:].strip() != "[DONE]":
+                d = json.loads(line[5:].strip())
+                if "error" in d:
+                    return True, str(d["error"].get("message", "Upstream Error")), False
+                choices = d.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content.startswith("\n[Stream Error:") or content.startswith("\n[Error from Gemini:"):
+                        return True, content.strip(), False
+                    if bool(content) or bool(delta.get("tool_calls")):
+                        return False, "", True
+    except Exception:
+        pass
+    return False, "", False
+
+
+async def handle_fallback_chat_completions(
+    req: ChatCompletionRequest,
+    request: Request,
+    api_key: str,
+):
+    """
+    Execute chat completions with multi-turn session degradation fallback strategy.
+    """
+    session_id, is_new = fallback_manager.resolve_session(req, dict(request.headers))
+    fallback_manager.get_or_create_session(session_id, is_new=is_new)
+
+    if not req.stream:
+        while True:
+            target_model = fallback_manager.get_active_model(session_id)
+            cloned_req = req.model_copy(update={"model": target_model})
+            logger.info(
+                f"[FALLBACK] Session '{session_id}' -> executing non-streaming with model '{target_model}'"
+            )
+            try:
+                result = await adapter.chat_completions(cloned_req, api_key)
+                if isinstance(result, dict) and "error" in result:
+                    status_code = result.get("error", {}).get("code", 400)
+                    if not isinstance(status_code, int) or status_code >= 400:
+                        err_msg = str(result["error"].get("message", "Error"))
+                        next_model = fallback_manager.record_failure(session_id, error_desc=err_msg)
+                        if next_model:
+                            continue
+                        return JSONResponse(
+                            status_code=status_code if isinstance(status_code, int) and 100 <= status_code <= 599 else 502,
+                            content=result,
+                        )
+
+                fallback_manager.record_success(session_id)
+                return result
+            except Exception as exc:
+                err_msg = f"{type(exc).__name__}: {exc}"
+                next_model = fallback_manager.record_failure(session_id, error_desc=err_msg)
+                if next_model:
+                    continue
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": {
+                            "message": f"All fallback models failed. Last error: {err_msg}",
+                            "type": "fallback_error",
+                            "code": 502,
+                        }
+                    },
+                )
+
+    # Streaming SSE response with automatic pre-stream failure interception & fallback
+    async def fallback_stream_generator():
+        nonlocal session_id
+        while True:
+            target_model = fallback_manager.get_active_model(session_id)
+            cloned_req = req.model_copy(update={"model": target_model})
+            logger.info(
+                f"[FALLBACK] Session '{session_id}' -> executing stream with model '{target_model}'"
+            )
+
+            stream_started = False
+            model_failed = False
+            fail_reason = ""
+            buffered_initial_chunks = []
+
+            try:
+                stream_iter = adapter.chat_completions_stream(cloned_req, api_key)
+                async for chunk in stream_iter:
+                    if not stream_started:
+                        is_err, err_msg, has_real_content = analyze_stream_chunk(chunk)
+                        if is_err:
+                            model_failed = True
+                            fail_reason = err_msg
+                            break
+                        if has_real_content:
+                            stream_started = True
+                            for b_chunk in buffered_initial_chunks:
+                                yield b_chunk
+                            buffered_initial_chunks.clear()
+                            yield chunk
+                        else:
+                            buffered_initial_chunks.append(chunk)
+                    else:
+                        yield chunk
+
+            except Exception as exc:
+                if not stream_started:
+                    model_failed = True
+                    fail_reason = f"{type(exc).__name__}: {exc}"
+                else:
+                    err_payload = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": target_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": f"\n[Stream Error: {type(exc).__name__}: {exc}]"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(err_payload)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+            if model_failed:
+                buffered_initial_chunks.clear()
+                next_model = fallback_manager.record_failure(session_id, error_desc=fail_reason)
+                if next_model:
+                    logger.warning(
+                        f"[FALLBACK] Upstream error detected before stream output. Switching session '{session_id}' to '{next_model}'..."
+                    )
+                    continue
+                else:
+                    err_payload = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": fallback_manager.virtual_model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": f"\n[All fallback models failed. Last error: {fail_reason}]"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(err_payload)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+            else:
+                fallback_manager.record_success(session_id)
+                return
+
+    return StreamingResponse(
+        fallback_stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "provider": adapter.provider_name}
@@ -405,9 +731,24 @@ async def health():
 @app.get("/models")
 @app.get("/v1/models")
 async def list_models(authorization: Optional[str] = Header(None)):
-    """List available models in OpenAI standard format."""
+    """List available models in OpenAI standard format, including virtual fallback model."""
     api_key = adapter.resolve_api_key(authorization)
     data = await adapter.list_models(api_key)
+    # Prepend virtual model entry if not already in list
+    v_id = fallback_manager.virtual_model_name
+    if not any(m.get("id") == v_id for m in data):
+        data.insert(
+            0,
+            {
+                "id": v_id,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "adapter",
+                "permission": [],
+                "root": v_id,
+                "parent": None,
+            },
+        )
     return {"object": "list", "data": data}
 
 
@@ -415,6 +756,16 @@ async def list_models(authorization: Optional[str] = Header(None)):
 @app.get("/v1/models/{model_id:path}")
 async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
     """Retrieve specific model details in OpenAI standard format."""
+    if fallback_manager.is_virtual_model(model_id):
+        return {
+            "id": fallback_manager.virtual_model_name,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "adapter",
+            "permission": [],
+            "root": fallback_manager.virtual_model_name,
+            "parent": None,
+        }
     api_key = adapter.resolve_api_key(authorization)
     model_info = await adapter.get_model(model_id, api_key)
     return model_info
@@ -424,9 +775,10 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
 @app.post("/v1/chat/completions")
 async def chat_completions(
     req: ChatCompletionRequest,
+    request: Request,
     authorization: Optional[str] = Header(None),
 ):
-    """Handle OpenAI chat completions with streaming, function calling, and provider routing."""
+    """Handle OpenAI chat completions with streaming, function calling, virtual fallback, and provider routing."""
     api_key = adapter.resolve_api_key(authorization)
     if not api_key:
         return JSONResponse(
@@ -439,6 +791,10 @@ async def chat_completions(
                 }
             },
         )
+
+    effective_model = req.model or adapter.default_model
+    if fallback_manager.is_virtual_model(effective_model):
+        return await handle_fallback_chat_completions(req, request, api_key)
 
     if req.stream:
         return StreamingResponse(
@@ -479,6 +835,16 @@ async def completions(
                 }
             },
         )
+
+    effective_model = req.model or adapter.default_model
+    if fallback_manager.is_virtual_model(effective_model):
+        for model_name in fallback_manager.fallback_models:
+            cloned_req = req.model_copy(update={"model": model_name})
+            result = await adapter.completions(cloned_req, api_key)
+            if isinstance(result, dict) and "error" in result:
+                continue
+            return result
+        return JSONResponse(status_code=400, content=result)
 
     result = await adapter.completions(req, api_key)
     if isinstance(result, dict) and "error" in result:
@@ -525,7 +891,38 @@ def main():
     parser.add_argument("--provider", default=None, help="AI Provider name (default: aistudio_gemini)")
     parser.add_argument("--key", default=None, help="API Key override")
     parser.add_argument("--model", default=None, help="Default Model override")
-    parser.add_argument("--log-file", default=None, help="Path to log file")
+    parser.add_argument(
+        "--virtual-model",
+        default=None,
+        help="Virtual fallback model name (default: auto)",
+    )
+    parser.add_argument(
+        "--fallback-models",
+        default=None,
+        help="Comma-separated model list for fallback (default: gemini-4-hydrogen,gemini-3.8-flash)",
+    )
+    parser.add_argument(
+        "--fallback-threshold",
+        type=int,
+        default=None,
+        help="Consecutive failure threshold before degrading to next model (default: 1)",
+    )
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Directory to store daily rotating log files (default: logs)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Deprecated: please use --log-dir instead",
+    )
+    parser.add_argument(
+        "--max-log-size-mb",
+        type=int,
+        default=None,
+        help="Maximum size in MB per log file before sequence increment (default: 30)",
+    )
     parser.add_argument(
         "--log-level",
         default=None,
@@ -535,7 +932,7 @@ def main():
 
     args = parser.parse_args()
 
-    global adapter, LOG_FILE
+    global adapter, LOG_DIR, MAX_LOG_SIZE_MB
     if args.provider:
         adapter = get_adapter(args.provider)
     if args.key:
@@ -544,14 +941,39 @@ def main():
     if args.model:
         if hasattr(adapter, "_default_model"):
             adapter._default_model = args.model
-    if args.log_file:
-        LOG_FILE = args.log_file
+
+    target_log_dir = args.log_dir
+    if not target_log_dir and args.log_file:
+        target_log_dir = (
+            os.path.dirname(args.log_file)
+            if args.log_file.lower().endswith(".log")
+            else args.log_file
+        )
+
+    if target_log_dir or args.max_log_size_mb:
+        configure_log_handler(
+            target_dir=target_log_dir or LOG_DIR,
+            max_mb=args.max_log_size_mb,
+        )
+
+    fallback_models_list = (
+        [m.strip() for m in args.fallback_models.split(",") if m.strip()]
+        if args.fallback_models
+        else None
+    )
+    fallback_manager.reconfigure(
+        virtual_model_name=args.virtual_model,
+        fallback_models=fallback_models_list,
+        failure_threshold=args.fallback_threshold,
+    )
+
     if args.log_level:
         set_log_level(args.log_level)
 
     resolved_key = adapter.resolve_api_key()
     masked_key = mask_secret(resolved_key) if resolved_key else "(not set - configure in .env)"
     current_level = logging.getLevelName(logger.level)
+    active_log_path = os.path.abspath(file_handler.baseFilename) if file_handler else "(disabled)"
 
     print("=" * 60)
     print(" Copilot OpenAI Adapter Server (Multi-Provider)")
@@ -559,11 +981,16 @@ def main():
     print(f" AI Provider        : {adapter.provider_name}")
     print(f" API Key            : {masked_key}")
     print(f" Default Model      : {adapter.default_model}")
+    print(f" Virtual Model      : {fallback_manager.virtual_model_name}")
+    print(f" Fallback Models    : {' -> '.join(fallback_manager.fallback_models)}")
+    print(f" Fallback Threshold : {fallback_manager.failure_threshold} failure(s)")
     print(f" Log Level          : {current_level}")
     print(f" Listening Address  : http://{args.host}:{args.port}")
     print(f" OpenAI Base URL    : http://127.0.0.1:{args.port}/v1")
     print(f" Models Endpoint    : http://127.0.0.1:{args.port}/v1/models")
-    print(f" Log File           : {os.path.abspath(LOG_FILE)}")
+    print(f" Log Directory      : {os.path.abspath(LOG_DIR)}")
+    print(f" Active Log File    : {active_log_path}")
+    print(f" Max File Size      : {MAX_LOG_SIZE_MB} MB (Rollover: yyyy-MM-dd.##.log)")
     print("=" * 60)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
