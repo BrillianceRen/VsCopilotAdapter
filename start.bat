@@ -1,9 +1,16 @@
 @echo off
-title Gemini to OpenAI Adapter (Visual Studio Copilot)
 cd /d "%~dp0"
 
+set VERSION=
+if exist "%~dp0VERSION" (
+    set /p VERSION=<"%~dp0VERSION"
+)
+if "%VERSION%"=="" set VERSION=1.4.0
+
+title Copilot OpenAI Adapter v%VERSION% (Visual Studio Copilot)
+
 echo ================================================================
-echo Starting Gemini to OpenAI Adapter for Visual Studio Copilot
+echo Starting Copilot OpenAI Adapter for Visual Studio Copilot v%VERSION%
 echo ================================================================
 
 set PYTHON_CMD=python

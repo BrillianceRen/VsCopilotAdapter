@@ -234,10 +234,27 @@ logger.propagate = False
 AI_PROVIDER = os.getenv("AI_PROVIDER", "aistudio_gemini").strip()
 adapter: BaseAIAdapter = get_adapter(AI_PROVIDER)
 
+
+def load_version() -> str:
+    """Read version string from VERSION file, with fallback."""
+    version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+    if os.path.exists(version_file):
+        try:
+            with open(version_file, "r", encoding="utf-8") as f:
+                v = f.read().strip()
+                if v:
+                    return v.lstrip("v")
+        except Exception as e:
+            logger.warning(f"Failed to read VERSION file: {e}")
+    return "1.4.0"
+
+
+__version__ = load_version()
+
 app = FastAPI(
     title="Copilot OpenAI Adapter",
     description=f"Multi-provider OpenAI-compatible adapter for Visual Studio Copilot (Active: {adapter.provider_name})",
-    version="2.0.0",
+    version=__version__,
 )
 
 # Enable CORS for Visual Studio, webviews, and external tools
@@ -539,7 +556,7 @@ async def root():
         "service": "copilot-openai-adapter",
         "provider": adapter.provider_name,
         "default_model": adapter.default_model,
-        "version": "2.0.0",
+        "version": __version__,
         "documentation": "/docs",
         "endpoints": {
             "models": "/v1/models",
@@ -885,7 +902,13 @@ async def embeddings(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Copilot OpenAI Adapter Server")
+    parser = argparse.ArgumentParser(description=f"Copilot OpenAI Adapter Server (v{__version__})")
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"Copilot OpenAI Adapter v{__version__}",
+    )
     parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"), help="Host address to bind")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")), help="Port to listen on")
     parser.add_argument("--provider", default=None, help="AI Provider name (default: aistudio_gemini)")
@@ -976,8 +999,9 @@ def main():
     active_log_path = os.path.abspath(file_handler.baseFilename) if file_handler else "(disabled)"
 
     print("=" * 60)
-    print(" Copilot OpenAI Adapter Server (Multi-Provider)")
+    print(f" Copilot OpenAI Adapter Server (v{__version__})")
     print("=" * 60)
+    print(f" Version            : v{__version__}")
     print(f" AI Provider        : {adapter.provider_name}")
     print(f" API Key            : {masked_key}")
     print(f" Default Model      : {adapter.default_model}")
@@ -992,6 +1016,11 @@ def main():
     print(f" Active Log File    : {active_log_path}")
     print(f" Max File Size      : {MAX_LOG_SIZE_MB} MB (Rollover: yyyy-MM-dd.##.log)")
     print("=" * 60)
+
+    logger.info(
+        f"Copilot OpenAI Adapter v{__version__} starting on http://{args.host}:{args.port} "
+        f"(Provider: {adapter.provider_name}, Default Model: {adapter.default_model})"
+    )
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

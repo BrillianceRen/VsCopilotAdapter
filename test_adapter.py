@@ -2,11 +2,19 @@ import asyncio
 import json
 import httpx
 from server import app
+from fallback_manager import fallback_manager
 
 async def run_tests():
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        print("[TEST 1] Testing GET /health...")
+        print("[TEST 0] Testing GET / (Root Info & Version)...")
+        res = await client.get("/")
+        assert res.status_code == 200, f"Expected 200, got {res.status_code}"
+        root_data = res.json()
+        assert root_data.get("version") == "1.4.0", f"Unexpected version: {root_data.get('version')}"
+        print("  -> OK:", root_data)
+
+        print("\n[TEST 1] Testing GET /health...")
         res = await client.get("/health")
         assert res.status_code == 200, f"Expected 200, got {res.status_code}"
         print("  -> OK:", res.json())
@@ -118,14 +126,14 @@ async def run_tests():
             print("  -> OK: Tool calls detected in stream:", called_tools)
             assert "get_weather" in called_tools
 
-        print("\n[TEST 9] Testing Virtual Fallback Model & Degradation Strategy (auto)...")
-        from fallback_manager import fallback_manager
-        # 1. Verify auto is present in models list
+        print(f"\n[TEST 9] Testing Virtual Fallback Model & Degradation Strategy ({fallback_manager.virtual_model_name})...")
+        # 1. Verify virtual model is present in models list
         res = await client.get("/v1/models")
         assert res.status_code == 200
         ids = [m["id"] for m in res.json()["data"]]
-        assert "auto" in ids, "Virtual model 'auto' should be in models list"
-        print("  -> OK: Virtual model 'auto' found in /v1/models")
+        vname = fallback_manager.virtual_model_name
+        assert vname in ids, f"Virtual model '{vname}' should be in models list"
+        print(f"  -> OK: Virtual model '{vname}' found in /v1/models")
 
         # 2. Test degradation recovery: invalid model -> gemini-3.8-flash
         orig_models = list(fallback_manager.fallback_models)
@@ -135,7 +143,7 @@ async def run_tests():
             # Turn 1: New session
             turn1_msgs = [{"role": "user", "content": "Test fallback session turn 1"}]
             fb_res = await client.post("/v1/chat/completions", json={
-                "model": "auto",
+                "model": vname,
                 "messages": turn1_msgs,
                 "max_tokens": 20
             })
@@ -149,7 +157,7 @@ async def run_tests():
                 {"role": "user", "content": "Test fallback session turn 2"}
             ]
             fb_res2 = await client.post("/v1/chat/completions", json={
-                "model": "auto",
+                "model": vname,
                 "messages": turn2_msgs,
                 "max_tokens": 20
             })
